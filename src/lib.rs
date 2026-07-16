@@ -26,7 +26,8 @@
 //!     * [ ] MS-PPT (PowerPoint 2002, 2003, 2004)
 //! * [ ] ECMA-376 (Extensible Encryption)
 //!
-//! Agile encrypted files that use non-SHA512 hash functions will yield [`DecryptError::Unimplemented`], though I haven't yet encountered such a file.
+//! Agile encryption supports SHA1, SHA256, SHA384, and SHA512 hash functions with AES-128/192/256
+//! (Apache POI defaults to SHA1 + AES-128). A wrong password yields [`DecryptError::InvalidPassword`].
 //!
 //! Note that the latest version of Word will create an Agile encrypted document.
 
@@ -100,13 +101,16 @@ fn decrypt_ooxml(olefile: &mut OleFile, password: &str) -> Result<Vec<u8>, Decry
     match encryption_info_stream.stream.get(..4) {
         Some([4, 0, 4, 0]) => {
             let aei = AgileEncryptionInfo::new(&encryption_info_stream)?;
-            let secret_key = aei.key_from_password(password)?;
+            let password_hash = aei.password_hash(password)?;
+            validate!(aei.verify_password(&password_hash)?, DecryptError::InvalidPassword)?;
+            let secret_key = aei.secret_key(&password_hash)?;
 
             aei.decrypt(&secret_key, &encrypted_package_stream)
         }
         Some([2 | 3 | 4, 0, 2, 0]) => {
             let sei = StandardEncryptionInfo::new(&encryption_info_stream)?;
             let secret_key = sei.key_from_password(password)?;
+            validate!(sei.verify_password(&secret_key)?, DecryptError::InvalidPassword)?;
 
             sei.decrypt(&secret_key, &encrypted_package_stream)
         }
@@ -124,6 +128,8 @@ pub enum DecryptError {
     InvalidStructure,
     #[error("File is not encrypted")]
     NotEncrypted,
+    #[error("Invalid password")]
+    InvalidPassword,
     #[error("Unimplemented: `{0}`")]
     Unimplemented(String),
     #[error("Unknown Error")]
