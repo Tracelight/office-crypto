@@ -32,7 +32,7 @@ let docx = read_docx(&decrypted).unwrap();
     * [ ] MS-PPT (PowerPoint 2002, 2003, 2004)
 * [ ] ECMA-376 (Extensible Encryption)
 
-Non-SHA512 hash functions are not yet implemented. This only affects Agile encrypted files, but I have yet to find one that doesn't use SHA512.
+Agile encryption supports SHA1, SHA256, SHA384, and SHA512 hash functions with AES-128/192/256 (Apache POI defaults to SHA1 + AES-128). Passwords are checked against the verifier blocks, so a wrong password yields `DecryptError::InvalidPassword` instead of garbage output.
 
 ## Performance
 

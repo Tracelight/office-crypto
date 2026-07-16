@@ -59,6 +59,64 @@ fn rc4_cryptoapi_doc() {
     assert_eq!(decrypted, expected);
 }
 
+// Fixtures for hash algorithms / key sizes Office rarely emits (but tools like Apache POI do).
+// Regenerate with `cargo test generate_agile_fixtures -- --ignored` (deterministic output);
+// validate against msoffcrypto-tool before committing.
+const AGILE_FIXTURES: &[(&str, utils::AgileParams)] = &[
+    // Apache POI's default agile parameters — the variant seen in production.
+    ("testAgileSha1Aes128.xlsx", utils::AgileParams { hash: "SHA1", key_bits: 128, spin_count: 100000 }),
+    ("testAgileSha256Aes256.xlsx", utils::AgileParams { hash: "SHA256", key_bits: 256, spin_count: 100000 }),
+    ("testAgileSha384Aes192.xlsx", utils::AgileParams { hash: "SHA384", key_bits: 192, spin_count: 100000 }),
+];
+
+#[test]
+#[ignore = "writes tests/files fixtures; run manually when parameters change"]
+fn generate_agile_fixtures() {
+    let plaintext = utils::read_test_file("expectedAgileSha512.xlsx");
+    for (name, params) in AGILE_FIXTURES {
+        let encrypted = utils::encrypt_agile(&plaintext, "testPassword", params);
+        std::fs::write(format!("tests/files/{name}"), encrypted).unwrap();
+    }
+}
+
+#[test]
+fn agile_other_hash_algorithms() {
+    let expected = utils::read_test_file("expectedAgileSha512.xlsx");
+    for (name, _) in AGILE_FIXTURES {
+        let decrypted = decrypt_from_bytes(utils::read_test_file(name), "testPassword").unwrap();
+        assert!(decrypted == expected, "fixture {name} did not round-trip");
+    }
+}
+
+#[test]
+fn agile_roundtrip_multi_segment() {
+    // > 1 segment (4096) with a non-block-aligned tail, to exercise segment IVs and truncation.
+    let plaintext: Vec<u8> = (0..10_000u32).flat_map(u32::to_le_bytes).collect();
+    let plaintext = &plaintext[..39_999];
+    let params = utils::AgileParams { hash: "SHA256", key_bits: 128, spin_count: 1000 };
+    let encrypted = utils::encrypt_agile(plaintext, "pw", &params);
+    let decrypted = decrypt_from_bytes(encrypted, "pw").unwrap();
+    assert!(decrypted == plaintext);
+}
+
+#[test]
+fn agile_wrong_password() {
+    // Word-produced SHA512 file and a generated SHA1 file both report InvalidPassword.
+    for name in ["testAgileSha512.xlsx", "testAgileSha1Aes128.xlsx"] {
+        let result = decrypt_from_bytes(utils::read_test_file(name), "wrongPassword");
+        assert!(
+            matches!(result, Err(DecryptError::InvalidPassword)),
+            "expected InvalidPassword for {name}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn standard_wrong_password() {
+    let result = decrypt_from_bytes(utils::read_test_file("testStandard.docx"), "wrongPassword");
+    assert!(matches!(result, Err(DecryptError::InvalidPassword)));
+}
+
 #[test]
 fn doc97_not_encrypted() {
     // expectedRC4CryptoAPI.doc is an unencrypted doc file

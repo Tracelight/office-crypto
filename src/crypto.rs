@@ -2,36 +2,124 @@ use crate::ole::OleStream;
 use crate::validate;
 use crate::DecryptError::{self, *};
 
-use aes::cipher::{
-    block_padding::NoPadding, generic_array::typenum::consts::U16, generic_array::GenericArray,
-    BlockDecryptMut, KeyInit, KeyIvInit,
-};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyInit, KeyIvInit};
 use base64::engine::general_purpose;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha1::Sha1;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::io::prelude::*;
 use std::io::Cursor;
 
-// unused blocks are meant to verify password/file integrity
-const _BLOCK1: [u8; 8] = [0xFE, 0xA7, 0xD2, 0x76, 0x3B, 0x4B, 0x9E, 0x79];
-const _BLOCK2: [u8; 8] = [0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E];
-const BLOCK3: [u8; 8] = [0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6];
-const _BLOCK4: [u8; 8] = [0x5F, 0xB2, 0xAD, 0x01, 0x0C, 0xB9, 0xE1, 0xF6];
-const _BLOCK5: [u8; 8] = [0xA0, 0x67, 0x7F, 0x02, 0xB2, 0x2C, 0x84, 0x33];
+// Block keys from MS-OFFCRYPTO 2.3.4.10 used to derive the purpose-specific keys.
+const BLOCK_VERIFIER_HASH_INPUT: [u8; 8] = [0xFE, 0xA7, 0xD2, 0x76, 0x3B, 0x4B, 0x9E, 0x79];
+const BLOCK_VERIFIER_HASH_VALUE: [u8; 8] = [0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E];
+const BLOCK_ENCRYPTED_KEY_VALUE: [u8; 8] = [0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6];
 
 const SEGMENT_LENGTH: usize = 4096;
-const ITER_COUNT: u32 = 50000;
+const AES_BLOCK_SIZE: usize = 16;
+const STANDARD_ITER_COUNT: u32 = 50000;
+// MS-OFFCRYPTO 2.3.4.5: spinCount MUST be no greater than 10,000,000.
+const MAX_SPIN_COUNT: u32 = 10_000_000;
 
-fn b64_decode(bytes: &[u8]) -> Result<Vec<u8>, DecryptError> {
-    let mut wrapped_reader = Cursor::new(bytes);
-    let mut decoder =
-        base64::read::DecoderReader::new(&mut wrapped_reader, &general_purpose::STANDARD);
+fn utf16le_bytes(password: &str) -> Vec<u8> {
+    password.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
 
-    let mut result = Vec::new();
-    decoder.read_to_end(&mut result).map_err(|_| Unknown)?;
-    Ok(result)
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HashAlgorithm {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HashAlgorithm {
+    fn parse(name: &str) -> Result<Self, DecryptError> {
+        match name {
+            "SHA1" | "SHA-1" => Ok(Self::Sha1),
+            "SHA256" | "SHA-256" => Ok(Self::Sha256),
+            "SHA384" | "SHA-384" => Ok(Self::Sha384),
+            "SHA512" | "SHA-512" => Ok(Self::Sha512),
+            // Remaining algorithms allowed by the spec (MD2, MD4, MD5, RIPEMD-128/160, WHIRLPOOL)
+            // have never been observed in the wild.
+            other => Err(Unimplemented(other.to_owned())),
+        }
+    }
+
+    fn digest(&self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha1 => Sha1::digest(data).to_vec(),
+            Self::Sha256 => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
+            Self::Sha512 => Sha512::digest(data).to_vec(),
+        }
+    }
+
+    /// The iterated hash of MS-OFFCRYPTO 2.3.4.11: `H_0 = H(salt + password)`, then
+    /// `H_i = H(i + H_{i-1})` for spin_count rounds. Monomorphized per algorithm to keep the hash
+    /// state on the stack in the hot loop.
+    fn iterated_hash(&self, salt: &[u8], password: &[u8], spin_count: u32) -> Vec<u8> {
+        fn run<D: Digest>(salt: &[u8], password: &[u8], spin_count: u32) -> Vec<u8> {
+            let mut h = D::new().chain_update(salt).chain_update(password).finalize();
+            for i in 0u32..spin_count {
+                h = D::new().chain_update(i.to_le_bytes()).chain_update(&h).finalize();
+            }
+            h.to_vec()
+        }
+        match self {
+            Self::Sha1 => run::<Sha1>(salt, password, spin_count),
+            Self::Sha256 => run::<Sha256>(salt, password, spin_count),
+            Self::Sha384 => run::<Sha384>(salt, password, spin_count),
+            Self::Sha512 => run::<Sha512>(salt, password, spin_count),
+        }
+    }
+}
+
+/// Truncate or pad with 0x36 to `len`, per MS-OFFCRYPTO 2.3.4.11/2.3.4.12.
+fn normalize_key(mut bytes: Vec<u8>, len: usize) -> Vec<u8> {
+    bytes.resize(len, 0x36);
+    bytes
+}
+
+/// AES-CBC-decrypt `ciphertext` (no padding), dispatching on key length (128/192/256 bits).
+fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptError> {
+    validate!(ciphertext.len().is_multiple_of(AES_BLOCK_SIZE), InvalidStructure)?;
+    let mut plaintext = vec![0u8; ciphertext.len()];
+    match key.len() {
+        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        32 => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        _ => return Err(InvalidStructure),
+    }
+    .map_err(|_| InvalidStructure)?;
+    Ok(plaintext)
+}
+
+/// AES-ECB-decrypt `ciphertext` (no padding), dispatching on key length (128/192/256 bits).
+fn aes_ecb_decrypt(key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, DecryptError> {
+    validate!(ciphertext.len().is_multiple_of(AES_BLOCK_SIZE), InvalidStructure)?;
+    let mut plaintext = vec![0u8; ciphertext.len()];
+    match key.len() {
+        16 => ecb::Decryptor::<aes::Aes128>::new_from_slice(key)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        24 => ecb::Decryptor::<aes::Aes192>::new_from_slice(key)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        32 => ecb::Decryptor::<aes::Aes256>::new_from_slice(key)
+            .map_err(|_| InvalidStructure)?
+            .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext),
+        _ => return Err(InvalidStructure),
+    }
+    .map_err(|_| InvalidStructure)?;
+    Ok(plaintext)
 }
 
 #[allow(dead_code)]
@@ -40,6 +128,7 @@ pub(crate) struct AgileEncryptionInfo {
     key_data_salt: Vec<u8>,
     key_data_hash_algorithm: String,
     key_data_block_size: u32,
+    key_data_key_bits: u32,
     encrypted_hmac_key: Vec<u8>,
     encrypted_hmac_value: Vec<u8>,
     encrypted_verifier_hash_input: Vec<u8>,
@@ -51,8 +140,19 @@ pub(crate) struct AgileEncryptionInfo {
     password_key_bits: u32,
 }
 
+fn b64_decode(bytes: &[u8]) -> Result<Vec<u8>, DecryptError> {
+    let mut wrapped_reader = Cursor::new(bytes);
+    let mut decoder =
+        base64::read::DecoderReader::new(&mut wrapped_reader, &general_purpose::STANDARD);
+
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).map_err(|_| Unknown)?;
+    Ok(result)
+}
+
 impl AgileEncryptionInfo {
     pub fn new(encryption_info: &OleStream) -> Result<Self, DecryptError> {
+        validate!(encryption_info.stream.len() >= 8, InvalidStructure)?;
         let raw_xml = String::from_utf8(encryption_info.stream[8..].to_vec())
             .map_err(|_| InvalidStructure)?;
 
@@ -65,7 +165,7 @@ impl AgileEncryptionInfo {
         let mut set_password_node = false;
 
         loop {
-            match reader.read_event().unwrap() {
+            match reader.read_event().map_err(|_| InvalidStructure)? {
                 Event::Empty(e) => match e.name().as_ref() {
                     b"keyData" if !set_key_data => {
                         for attr in e.attributes() {
@@ -81,6 +181,13 @@ impl AgileEncryptionInfo {
                                 }
                                 b"blockSize" => {
                                     aei.key_data_block_size =
+                                        String::from_utf8(attr.value.into_owned())
+                                            .map_err(|_| InvalidStructure)?
+                                            .parse()
+                                            .map_err(|_| InvalidStructure)?;
+                                }
+                                b"keyBits" => {
+                                    aei.key_data_key_bits =
                                         String::from_utf8(attr.value.into_owned())
                                             .map_err(|_| InvalidStructure)?
                                             .parse()
@@ -155,14 +262,49 @@ impl AgileEncryptionInfo {
         validate!(set_key_data, InvalidStructure)?;
         validate!(set_hmac_data, InvalidStructure)?;
         validate!(set_password_node, InvalidStructure)?;
+        validate!(aei.spin_count <= MAX_SPIN_COUNT, InvalidStructure)?;
+        validate!(
+            matches!(aei.key_data_key_bits, 128 | 192 | 256),
+            InvalidStructure
+        )?;
+        validate!(
+            matches!(aei.password_key_bits, 128 | 192 | 256),
+            InvalidStructure
+        )?;
 
         Ok(aei)
     }
 
-    pub fn key_from_password(&self, password: &str) -> Result<Vec<u8>, DecryptError> {
-        let digest = self.iterated_hash_from_password(password)?;
-        let encryption_key = self.encryption_key(&digest, &BLOCK3)?;
-        self.decrypt_aes_cbc(&encryption_key)
+    /// The expensive iterated password hash (spin_count rounds). Compute once and reuse for
+    /// verification and key derivation.
+    pub fn password_hash(&self, password: &str) -> Result<Vec<u8>, DecryptError> {
+        let alg = HashAlgorithm::parse(&self.password_hash_algorithm)?;
+        Ok(alg.iterated_hash(&self.password_salt, &utf16le_bytes(password), self.spin_count))
+    }
+
+    /// Check the password against the verifier blocks (MS-OFFCRYPTO 2.3.4.13).
+    pub fn verify_password(&self, password_hash: &[u8]) -> Result<bool, DecryptError> {
+        let alg = HashAlgorithm::parse(&self.password_hash_algorithm)?;
+        let iv = normalize_key(self.password_salt.clone(), AES_BLOCK_SIZE);
+
+        let input_key = self.derived_key(password_hash, &BLOCK_VERIFIER_HASH_INPUT)?;
+        let verifier_input = aes_cbc_decrypt(&input_key, &iv, &self.encrypted_verifier_hash_input)?;
+        let actual_hash = alg.digest(&verifier_input);
+
+        let value_key = self.derived_key(password_hash, &BLOCK_VERIFIER_HASH_VALUE)?;
+        let expected_hash = aes_cbc_decrypt(&value_key, &iv, &self.encrypted_verifier_hash_value)?;
+
+        // The stored hash is zero-padded up to a cipher block multiple; compare only the hash.
+        validate!(expected_hash.len() >= actual_hash.len(), InvalidStructure)?;
+        Ok(expected_hash[..actual_hash.len()] == actual_hash)
+    }
+
+    /// Decrypt the intermediate key that encrypts the package (MS-OFFCRYPTO 2.3.4.13).
+    pub fn secret_key(&self, password_hash: &[u8]) -> Result<Vec<u8>, DecryptError> {
+        let key = self.derived_key(password_hash, &BLOCK_ENCRYPTED_KEY_VALUE)?;
+        let iv = normalize_key(self.password_salt.clone(), AES_BLOCK_SIZE);
+        let secret_key = aes_cbc_decrypt(&key, &iv, &self.encrypted_key_value)?;
+        Ok(normalize_key(secret_key, self.key_data_key_bits as usize / 8))
     }
 
     pub fn decrypt(
@@ -170,129 +312,35 @@ impl AgileEncryptionInfo {
         key: &[u8],
         encrypted_stream: &OleStream,
     ) -> Result<Vec<u8>, DecryptError> {
-        let total_size = u32::from_le_bytes(
-            encrypted_stream.stream[..4]
-                .try_into()
-                .map_err(|_| InvalidStructure)?,
-        ) as usize;
-        let mut block_start: usize = 8; // skip first 8 bytes
-        let mut block_index: u32 = 0;
-        let mut decrypted: Vec<u8> = vec![0; total_size];
-        let key_data_salt: &[u8] = &self.key_data_salt;
+        let alg = HashAlgorithm::parse(&self.key_data_hash_algorithm)?;
+        let stream = &encrypted_stream.stream;
+        validate!(stream.len() >= 8, InvalidStructure)?;
+        let total_size = u64::from_le_bytes(stream[..8].try_into().map_err(|_| InvalidStructure)?);
+        let total_size = usize::try_from(total_size).map_err(|_| InvalidStructure)?;
 
-        match self.key_data_hash_algorithm.as_str() {
-            "SHA512" => {
-                while block_start < (total_size - SEGMENT_LENGTH) {
-                    let iv = Sha512::digest([key_data_salt, &block_index.to_le_bytes()].concat());
-                    let iv = &iv[..16];
-
-                    let cbc_cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
-
-                    // decrypt from encrypted_stream directly to output Vec
-                    cbc_cipher
-                        .decrypt_padded_b2b_mut::<NoPadding>(
-                            &encrypted_stream.stream[block_start..(block_start + SEGMENT_LENGTH)],
-                            &mut decrypted[(block_start - 8)..(block_start - 8 + SEGMENT_LENGTH)],
-                        )
-                        .map_err(|_| InvalidStructure)?;
-
-                    block_index += 1;
-                    block_start += SEGMENT_LENGTH;
-                }
-                // parse last block w less than 4096 bytes
-                let remaining = total_size - (block_start - 8);
-                let iv = Sha512::digest([key_data_salt, &block_index.to_le_bytes()].concat());
-                let iv = &iv[..16];
-
-                let cbc_cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
-                let irregular_block_len = remaining % 16;
-
-                // remaining bytes in encrypted_stream should be a multiple of block size even if we only use some of the decrypted bytes
-                let ciphertext = &encrypted_stream.stream[block_start..];
-                validate!(ciphertext.len() % 16 == 0, InvalidStructure)?;
-
-                let mut plaintext: Vec<u8> = vec![0; ciphertext.len()];
-                cbc_cipher
-                    .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext)
-                    .map_err(|_| InvalidStructure)?;
-                let mut copy_span = plaintext.len() - 16 + irregular_block_len;
-                if irregular_block_len == 0 {
-                    copy_span += 16;
-                }
-                decrypted[(block_start - 8)..(block_start + copy_span - 8)]
-                    .copy_from_slice(&plaintext[..copy_span]);
-                Ok(decrypted)
-            }
-            "SHA384" => Err(Unimplemented("SHA384".to_owned())),
-            "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
-            _ => Err(InvalidStructure),
+        let ciphertext = &stream[8..];
+        let mut decrypted = Vec::with_capacity(ciphertext.len());
+        for (block_index, segment) in ciphertext.chunks(SEGMENT_LENGTH).enumerate() {
+            let iv = alg.digest(
+                &[
+                    self.key_data_salt.as_slice(),
+                    &(block_index as u32).to_le_bytes(),
+                ]
+                .concat(),
+            );
+            let iv = normalize_key(iv, self.key_data_block_size as usize);
+            decrypted.extend_from_slice(&aes_cbc_decrypt(key, &iv, segment)?);
         }
+
+        validate!(decrypted.len() >= total_size, InvalidStructure)?;
+        decrypted.truncate(total_size);
+        Ok(decrypted)
     }
 
-    // this function is ridiculously expensive as it usually runs 10000 SHA512's
-    fn iterated_hash_from_password(&self, password: &str) -> Result<Vec<u8>, DecryptError> {
-        let pass_utf16: Vec<u16> = password.encode_utf16().collect();
-        let pass_utf16: &[u8] = unsafe { pass_utf16.align_to::<u8>().1 };
-        let salted: Vec<u8> = [&self.password_salt, pass_utf16].concat();
-        // TODO rewrite and pass ShaXXX:digest() as param?
-        // could maybe abstract over T: Digest but the Sha512 type alias is weird
-        match self.password_hash_algorithm.as_str() {
-            "SHA512" => {
-                let mut h = Sha512::digest(salted);
-                for i in 0u32..self.spin_count {
-                    h = Sha512::digest([&i.to_le_bytes(), h.as_slice()].concat());
-                }
-
-                Ok(h.as_slice().to_owned())
-            }
-            "SHA384" => Err(Unimplemented("SHA384".to_owned())),
-            "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
-            _ => Err(InvalidStructure),
-        }
-    }
-
-    fn encryption_key(&self, digest: &[u8], block: &[u8]) -> Result<Vec<u8>, DecryptError> {
-        match self.password_hash_algorithm.as_str() {
-            "SHA512" => {
-                let h = Sha512::digest([digest, block].concat());
-                Ok(h.as_slice()[..(self.password_key_bits as usize / 8)].to_owned())
-            }
-            "SHA384" => Err(Unimplemented("SHA384".to_owned())),
-            "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
-            _ => Err(InvalidStructure),
-        }
-    }
-
-    fn decrypt_aes_cbc(&self, key: &[u8]) -> Result<Vec<u8>, DecryptError> {
-        let mut cbc_cipher =
-            cbc::Decryptor::<aes::Aes256>::new(key.into(), self.password_salt.as_slice().into());
-
-        // two 16-byte cbc blocks
-        // TODO how does the hash func affect # of blocks?
-        let i1: GenericArray<u8, U16> =
-            GenericArray::clone_from_slice(&self.encrypted_key_value.clone()[..16]);
-        let i2: GenericArray<u8, U16> =
-            GenericArray::clone_from_slice(&self.encrypted_key_value.clone()[16..]);
-        let ciphertext_blocks = [i1, i2];
-
-        let o1: GenericArray<u8, U16> = GenericArray::default();
-        let o2: GenericArray<u8, U16> = GenericArray::default();
-        let mut plaintext_blocks = [o1, o2];
-
-        cbc_cipher
-            .decrypt_blocks_b2b_mut(&ciphertext_blocks, &mut plaintext_blocks)
-            .map_err(|_| Unknown)?;
-
-        let plaintext = [
-            plaintext_blocks[0].as_slice(),
-            plaintext_blocks[1].as_slice(),
-        ]
-        .concat();
-
-        Ok(plaintext)
+    fn derived_key(&self, password_hash: &[u8], block: &[u8]) -> Result<Vec<u8>, DecryptError> {
+        let alg = HashAlgorithm::parse(&self.password_hash_algorithm)?;
+        let h = alg.digest(&[password_hash, block].concat());
+        Ok(normalize_key(h, self.password_key_bits as usize / 8))
     }
 }
 
@@ -322,12 +370,18 @@ impl StandardEncryptionInfo {
         //         .try_into()
         //         .map_err(|_| InvalidStructure)?,
         // );
+        validate!(encryption_info.stream.len() >= 12, InvalidStructure)?;
         let header_size = u32::from_le_bytes(
             encryption_info.stream[8..12]
                 .try_into()
                 .map_err(|_| InvalidStructure)?,
         );
-        let header_bytes = &encryption_info.stream[12..(12 + header_size as usize)];
+        let header_end = (header_size as usize)
+            .checked_add(12)
+            .ok_or(InvalidStructure)?;
+        validate!(header_size >= 32, InvalidStructure)?;
+        validate!(encryption_info.stream.len() >= header_end, InvalidStructure)?;
+        let header_bytes = &encryption_info.stream[12..header_end];
         let mut sei = Self::default();
 
         // TODO switch to packed struct maybe
@@ -378,7 +432,8 @@ impl StandardEncryptionInfo {
             Unimplemented("RC4".to_owned())
         )?;
 
-        let verifier_bytes = &encryption_info.stream[(12 + header_size as usize)..];
+        let verifier_bytes = &encryption_info.stream[header_end..];
+        validate!(verifier_bytes.len() >= 72, InvalidStructure)?;
 
         sei.salt_size = u32::from_le_bytes(
             verifier_bytes[..4]
@@ -398,11 +453,10 @@ impl StandardEncryptionInfo {
     }
 
     pub fn key_from_password(&self, password: &str) -> Result<Vec<u8>, DecryptError> {
-        let pass_utf16: Vec<u16> = password.encode_utf16().collect();
-        let pass_utf16: &[u8] = unsafe { pass_utf16.align_to::<u8>().1 };
+        let pass_utf16 = utf16le_bytes(password);
 
-        let mut h = Sha1::digest([&self.salt, pass_utf16].concat());
-        for i in 0u32..ITER_COUNT {
+        let mut h = Sha1::digest([self.salt.as_slice(), &pass_utf16].concat());
+        for i in 0u32..STANDARD_ITER_COUNT {
             h = Sha1::digest([&i.to_le_bytes(), h.as_slice()].concat());
         }
 
@@ -422,6 +476,18 @@ impl StandardEncryptionInfo {
         Ok([x1, x2].concat()[..(cb_required_key_length as usize)].to_owned())
     }
 
+    /// Check the password against the verifier blocks (MS-OFFCRYPTO 2.3.4.9).
+    pub fn verify_password(&self, key: &[u8]) -> Result<bool, DecryptError> {
+        let verifier = aes_ecb_decrypt(key, &self.encrypted_verifier)?;
+        let verifier_hash = aes_ecb_decrypt(key, &self.encrypted_verifier_hash)?;
+        let actual_hash = Sha1::digest(&verifier);
+
+        let hash_size = self.verifier_hash_size as usize;
+        validate!(hash_size <= actual_hash.len(), InvalidStructure)?;
+        validate!(verifier_hash.len() >= hash_size, InvalidStructure)?;
+        Ok(verifier_hash[..hash_size] == actual_hash[..hash_size])
+    }
+
     pub fn decrypt(
         &self,
         key: &[u8],
@@ -432,24 +498,12 @@ impl StandardEncryptionInfo {
                 .try_into()
                 .map_err(|_| InvalidStructure)?,
         ) as usize;
-        // has to be big enough to decrypt into
-        let mut decrypted: Vec<u8> = vec![0; encrypted_stream.stream.len()];
         let block_start = 8;
+        let ciphertext = &encrypted_stream.stream[block_start..];
 
-        // 16 bit blocks
-        validate!(
-            (encrypted_stream.stream.len() - 8) % 16 == 0,
-            InvalidStructure
-        )?;
-
-        let ecb_cipher = ecb::Decryptor::<aes::Aes128>::new(key.into());
-        ecb_cipher
-            .decrypt_padded_b2b_mut::<NoPadding>(
-                &encrypted_stream.stream[block_start..],
-                &mut decrypted,
-            )
-            .map_err(|_| InvalidStructure)?;
-
-        Ok(decrypted[..total_size].to_vec())
+        let mut decrypted = aes_ecb_decrypt(key, ciphertext)?;
+        validate!(decrypted.len() >= total_size, InvalidStructure)?;
+        decrypted.truncate(total_size);
+        Ok(decrypted)
     }
 }

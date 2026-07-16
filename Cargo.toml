@@ -35,7 +35,9 @@ thiserror = "2.0.17"
 
 [dev-dependencies]
 bencher = "0.1.5"
+cfb = "0.14.0"
 docx-rs = "0.4.2"
+hmac = "0.12"
 
 [[bench]]
 name = "bench"
