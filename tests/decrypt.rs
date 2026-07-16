@@ -118,6 +118,36 @@ fn standard_wrong_password() {
 }
 
 #[test]
+fn standard_truncated_package() {
+    let (info, _) = utils::read_ole_streams(utils::read_test_file("testStandard.docx"));
+    let result = decrypt_from_bytes(utils::build_ole(&info, &[1, 2, 3]), "Password1234_");
+    assert!(
+        matches!(result, Err(DecryptError::InvalidStructure)),
+        "expected InvalidStructure, got {result:?}"
+    );
+}
+
+#[test]
+fn agile_rejects_non_aes_block_size() {
+    let (info, package) =
+        utils::read_ole_streams(utils::read_test_file("testAgileSha1Aes128.xlsx"));
+    let xml = String::from_utf8(info[8..].to_vec()).unwrap();
+    // Rewrite keyData/@blockSize only; p:encryptedKey carries a blockSize of its own.
+    let (key_data, rest) = xml.split_once("<dataIntegrity").unwrap();
+    let key_data = key_data.replace(r#"blockSize="16""#, r#"blockSize="2000000000""#);
+    let mut info = info[..8].to_vec();
+    info.extend_from_slice(format!("{key_data}<dataIntegrity{rest}").as_bytes());
+
+    // A wrong password, so this fails if blockSize is only rejected later by the cipher: the
+    // verifier would reach InvalidPassword first, and nothing would bound the IV allocation.
+    let result = decrypt_from_bytes(utils::build_ole(&info, &package), "wrongPassword");
+    assert!(
+        matches!(result, Err(DecryptError::InvalidStructure)),
+        "expected InvalidStructure, got {result:?}"
+    );
+}
+
+#[test]
 fn doc97_not_encrypted() {
     // expectedRC4CryptoAPI.doc is an unencrypted doc file
     let result =

@@ -22,6 +22,38 @@ pub fn read_test_file(name: &str) -> Vec<u8> {
     data
 }
 
+/// Wrap the two OOXML encryption streams in an OLE compound file.
+pub fn build_ole(encryption_info: &[u8], encrypted_package: &[u8]) -> Vec<u8> {
+    let mut comp = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    comp.create_stream("EncryptionInfo")
+        .unwrap()
+        .write_all(encryption_info)
+        .unwrap();
+    comp.create_stream("EncryptedPackage")
+        .unwrap()
+        .write_all(encrypted_package)
+        .unwrap();
+    comp.flush().unwrap();
+    comp.into_inner().into_inner()
+}
+
+/// The `EncryptionInfo` and `EncryptedPackage` streams of an OLE-wrapped Office file.
+pub fn read_ole_streams(raw: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let mut comp = cfb::CompoundFile::open(Cursor::new(raw)).unwrap();
+    let mut encryption_info = Vec::new();
+    comp.open_stream("EncryptionInfo")
+        .unwrap()
+        .read_to_end(&mut encryption_info)
+        .unwrap();
+    let mut encrypted_package = Vec::new();
+    comp.open_stream("EncryptedPackage")
+        .unwrap()
+        .read_to_end(&mut encrypted_package)
+        .unwrap();
+
+    (encryption_info, encrypted_package)
+}
+
 // A minimal ECMA-376 agile *encryptor*, used to generate test fixtures for hash algorithms and
 // key sizes that Office itself rarely produces (e.g. Apache POI's SHA1 + AES128 default).
 // Fixtures generated with it are cross-validated against Python msoffcrypto-tool (the reference
@@ -221,16 +253,5 @@ pub fn encrypt_agile(plaintext: &[u8], password: &str, params: &AgileParams) -> 
     let mut encryption_info = vec![4, 0, 4, 0, 0x40, 0, 0, 0];
     encryption_info.extend_from_slice(xml.as_bytes());
 
-    // Wrap both streams in an OLE compound file.
-    let mut comp = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
-    comp.create_stream("EncryptionInfo")
-        .unwrap()
-        .write_all(&encryption_info)
-        .unwrap();
-    comp.create_stream("EncryptedPackage")
-        .unwrap()
-        .write_all(&package)
-        .unwrap();
-    comp.flush().unwrap();
-    comp.into_inner().into_inner()
+    build_ole(&encryption_info, &package)
 }

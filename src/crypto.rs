@@ -267,6 +267,12 @@ impl AgileEncryptionInfo {
             matches!(aei.key_data_key_bits, 128 | 192 | 256),
             InvalidStructure
         )?;
+        // MS-OFFCRYPTO 2.3.4.5: blockSize is the cipher block size, and MUST be 16 for AES. It
+        // sizes the per-segment IV buffer, so an unchecked value is an allocation the file picks.
+        validate!(
+            aei.key_data_block_size as usize == AES_BLOCK_SIZE,
+            InvalidStructure
+        )?;
         validate!(
             matches!(aei.password_key_bits, 128 | 192 | 256),
             InvalidStructure
@@ -493,13 +499,11 @@ impl StandardEncryptionInfo {
         key: &[u8],
         encrypted_stream: &OleStream,
     ) -> Result<Vec<u8>, DecryptError> {
-        let total_size = u32::from_le_bytes(
-            encrypted_stream.stream[..4]
-                .try_into()
-                .map_err(|_| InvalidStructure)?,
-        ) as usize;
-        let block_start = 8;
-        let ciphertext = &encrypted_stream.stream[block_start..];
+        let stream = &encrypted_stream.stream;
+        validate!(stream.len() >= 8, InvalidStructure)?;
+        let total_size =
+            u32::from_le_bytes(stream[..4].try_into().map_err(|_| InvalidStructure)?) as usize;
+        let ciphertext = &stream[8..];
 
         let mut decrypted = aes_ecb_decrypt(key, ciphertext)?;
         validate!(decrypted.len() >= total_size, InvalidStructure)?;
